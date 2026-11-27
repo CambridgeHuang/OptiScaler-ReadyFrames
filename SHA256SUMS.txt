@@ -1,3 +1,5 @@
+# v0.1.1 release assets / checksums
 1dd10e7e2966c56126cfa443c66e7909431e4d69eaf9390a4ba786827433b598  OptiScaler.dll
 6b80c5f0b234a216d7bf79a9234547418f16c88849e1f58d5a1d446aafb0fe52  ReadyFrames-b7b07d2d.patch
+# complete corresponding source, hosted as an asset in the v0.1 release
 3be0a64c8fcf4a981bd33f49351456a639fe9fa9a0e6cb450e91dc112fa85f7c  OptiScaler-ReadyFrames-source-b7b07d2d.zip
