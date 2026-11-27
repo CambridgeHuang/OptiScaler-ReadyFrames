@@ -1,0 +1,524 @@
+diff --git a/OptiScaler.ini b/OptiScaler.ini
+--- a/OptiScaler.ini
++++ b/OptiScaler.ini
+@@ -346,6 +346,10 @@
+ 
+ ; Default (auto) is true
+ UseGamesReflexMarkers=auto
++
++; Consecutive ready frames for DX12 Streamline input to FSR FG or XeFG
++; 0 = original behavior, 1 to 300 = ready frames, auto = 30
++RequiredReadyFrames=auto
+ 
+ ; For overriding game's value sent to SL, could be Nvngx FG, could be noFG when someone uses real DLSSG
+ ; Default (auto) is no override
+diff --git a/OptiScaler/Config.cpp b/OptiScaler/Config.cpp
+--- a/OptiScaler/Config.cpp
++++ b/OptiScaler/Config.cpp
+@@ -253,6 +253,10 @@
+                 FGDLSSGInterpolationCount.reset();
+ 
+             FGDLSSGUseGamesReflexMarkers.set_from_config(readBool("DLSSG", "UseGamesReflexMarkers"));
++            FGDLSSGRequiredReadyFrames.set_from_config(readInt("DLSSG", "RequiredReadyFrames"));
++            if (FGDLSSGRequiredReadyFrames.has_value() &&
++                (FGDLSSGRequiredReadyFrames.value() < 0 || FGDLSSGRequiredReadyFrames.value() > 300))
++                FGDLSSGRequiredReadyFrames.reset();
+ 
+             FGDLSSGOverrideInterpolationCount.set_from_config(readInt("DLSSG", "OverrideInterpolationCount"));
+             if (FGDLSSGOverrideInterpolationCount.has_value() &&
+@@ -1509,6 +1513,8 @@
+                      GetIntValue(Instance()->FGDLSSGInterpolationCount.value_for_config()).c_str());
+         ini.SetValue("DLSSG", "UseGamesReflexMarkers",
+                      GetBoolValue(Instance()->FGDLSSGUseGamesReflexMarkers.value_for_config()).c_str());
++        ini.SetValue("DLSSG", "RequiredReadyFrames",
++                     GetIntValue(Instance()->FGDLSSGRequiredReadyFrames.value_for_config()).c_str());
+         ini.SetValue("DLSSG", "OverrideInterpolationCount",
+                      GetIntValue(Instance()->FGDLSSGOverrideInterpolationCount.value_for_config()).c_str());
+         ini.SetValue("DLSSG", "FramerateTargetDMFG",
+diff --git a/OptiScaler/Config.h b/OptiScaler/Config.h
+--- a/OptiScaler/Config.h
++++ b/OptiScaler/Config.h
+@@ -755,6 +755,7 @@
+     // DLSSG
+     CustomOptional<int> FGDLSSGInterpolationCount { 1 }; // For Opti's own SL instance
+     CustomOptional<bool> FGDLSSGUseGamesReflexMarkers { true };
++    CustomOptional<int> FGDLSSGRequiredReadyFrames { 30 };
+     CustomOptional<int, NoDefault>
+         FGDLSSGOverrideInterpolationCount; // For overriding game's value sent to SL, could be Nvngx FG, could be noFG
+                                            // but someone just uses real DLSSG
+diff --git a/OptiScaler/inputs/FG/StreamlineReadyFrames.h b/OptiScaler/inputs/FG/StreamlineReadyFrames.h
+new file mode 100644
+--- /dev/null
++++ b/OptiScaler/inputs/FG/StreamlineReadyFrames.h
+@@ -0,0 +1,65 @@
++#pragma once
++
++#include <array>
++#include <cstdint>
++#include <optional>
++
++class StreamlineReadyFrames
++{
++  public:
++    enum Input : uint8_t { Constants = 1, Depth = 2, MotionVectors = 4 };
++    struct Result
++    {
++        bool ready;
++        uint32_t count;
++    };
++
++    void Reset()
++    {
++        _inputs = {};
++        _count = 0;
++        // Keep the last presented token so Off/On cannot count the same frame twice.
++    }
++
++    void Observe(uint32_t frame, Input input, bool valid)
++    {
++        if (_last && frame == *_last)
++            return;
++        auto& entry = _inputs[frame % _inputs.size()];
++        if (!entry.frame || *entry.frame != frame)
++            entry = { frame, 0 };
++        if (valid)
++            entry.mask |= input;
++        else
++            entry.mask &= ~input;
++    }
++
++    bool CanActivate(uint32_t frame, uint32_t required) const
++    {
++        return required == 0 || (_count >= required && _last && frame == *_last + 1u);
++    }
++
++    std::optional<Result> Present(uint32_t frame)
++    {
++        if (_last && frame == *_last)
++            return std::nullopt;
++        const auto& entry = _inputs[frame % _inputs.size()];
++        const bool ready = entry.frame == frame && entry.mask == (Constants | Depth | MotionVectors);
++        if (!_last || frame != *_last + 1u || !ready)
++            _count = 0;
++        if (ready && _count < 300)
++            ++_count;
++        _last = frame;
++        return Result { ready, _count };
++    }
++
++  private:
++    struct Entry
++    {
++        std::optional<uint32_t> frame;
++        uint8_t mask = 0;
++    };
++    std::array<Entry, 8> _inputs {};
++    std::optional<uint32_t> _last;
++    uint32_t _count = 0;
++};
+diff --git a/OptiScaler/inputs/FG/Streamline_Inputs.cpp b/OptiScaler/inputs/FG/Streamline_Inputs.cpp
+--- a/OptiScaler/inputs/FG/Streamline_Inputs.cpp
++++ b/OptiScaler/inputs/FG/Streamline_Inputs.cpp
+@@ -4,6 +4,88 @@
+ #include <resource_tracking/ResTrack_dx12.h>
+ #include <magic_enum.hpp>
+ 
++bool Sl_Inputs::SupportsReadyFrames()
++{
++    const auto& state = State::Instance();
++    return state.activeFgInput == FGInput::DLSSG && state.streamlineVersion.major >= 2 &&
++           state.swapchainApi == DX12 && state.swapchainInteropApi == SwapchainInteropApi::None &&
++           (state.activeFgOutput == FGOutput::FSRFG || state.activeFgOutput == FGOutput::XeFG);
++}
++
++void Sl_Inputs::ResetReadyFramesLocked()
++{
++    _readyFrames.Reset();
++    _readyCandidate.reset();
++    _readyPresentHint.reset();
++}
++
++void Sl_Inputs::ReportReadyMode(bool enabled, uint32_t viewport)
++{
++    std::scoped_lock lock(_readyMutex);
++    if (_readyViewport != viewport || _readyRequested != enabled)
++        ResetReadyFramesLocked();
++    _readyViewport = viewport;
++    _readyRequested = enabled;
++}
++
++bool Sl_Inputs::AllowReadyActivation(uint32_t frameId, uint32_t viewport)
++{
++    const auto required = Config::Instance()->FGDLSSGRequiredReadyFrames.value_or_default();
++    std::scoped_lock lock(_readyMutex);
++    return _readyRequested && _readyViewport == viewport && _readyFrames.CanActivate(frameId, required);
++}
++
++void Sl_Inputs::BeforeReadyPresent(IFGFeature* fg)
++{
++    const auto config = Config::Instance();
++    const auto required = config->FGDLSSGRequiredReadyFrames.value_or_default();
++    const bool enabled = config->IsFGEnabled();
++    const auto& state = State::Instance();
++    std::optional<StreamlineReadyFrames::Result> result;
++    bool keepActive = false;
++    {
++        std::scoped_lock lock(_readyMutex);
++        if (!required || !enabled || !_readyRequested || state.fgChanged || state.scChanged)
++            ResetReadyFramesLocked();
++        else
++        {
++            const auto candidate = _readyPresentHint ? _readyPresentHint : _readyCandidate;
++            _readyPresentHint.reset();
++            _readyCandidate.reset();
++            if (candidate)
++            {
++                result = _readyFrames.Present(*candidate);
++                // A repeated marker for the last token must not reset or extend the streak.
++                if (!result)
++                    return;
++                keepActive = result->ready;
++            }
++            else
++                ResetReadyFramesLocked();
++        }
++    }
++
++    if (!required)
++        return;
++
++    if (result && result->count == static_cast<uint32_t>(required) && !fg->IsActive())
++        LOG_DEBUG("Streamline FG armed after {} ready frames", required);
++
++    if (keepActive && fg->IsActive() && !fg->IsPaused())
++    {
++        // Tags prove the game supplied inputs, not that the backend accepted them.
++        const auto index = fg->GetIndexWillBeDispatched();
++        keepActive = fg->IsResourceReady(FG_ResourceType::Depth, index) &&
++                     fg->IsResourceReady(FG_ResourceType::Velocity, index);
++    }
++
++    if (!keepActive && fg->IsActive())
++    {
++        LOG_DEBUG("Streamline FG stopped before Present: off or frame data incomplete");
++        fg->Disable();
++    }
++}
++
+ void Sl_Inputs::CheckForFrame(IFGFeature* fg, uint32_t frameId)
+ {
+     std::scoped_lock lock(_frameBoundaryMutex);
+@@ -50,7 +132,7 @@
+     return -1;
+ }
+ 
+-bool Sl_Inputs::setConstants(const sl::Constants& values, uint32_t frameId)
++bool Sl_Inputs::setConstants(const sl::Constants& values, uint32_t frameId, uint32_t viewport)
+ {
+     auto& state = State::Instance();
+     auto fgOutput = state.CurrentFG();
+@@ -79,6 +161,21 @@
+         data.next = pNext;
+ 
+         dataFound = true;
++    }
++
++    const bool useReadyFrames = SupportsReadyFrames() &&
++                                Config::Instance()->FGDLSSGRequiredReadyFrames.value_or_default() != 0;
++    if (useReadyFrames)
++    {
++        std::scoped_lock lock(_readyMutex);
++        if (state.fgChanged || state.scChanged || !Config::Instance()->IsFGEnabled())
++            ResetReadyFramesLocked();
++        if (_readyRequested && _readyViewport == viewport)
++        {
++            _readyCandidate = frameId;
++            _readyFrames.Observe(frameId, StreamlineReadyFrames::Constants,
++                                 dataFound && data.reset != sl::Boolean::eTrue);
++        }
+     }
+ 
+     if (dataFound)
+@@ -151,7 +248,30 @@
+         {
+             if (!fgOutput->IsActive() && !fgOutput->IsPaused())
+             {
+-                fgOutput->Activate();
++                if (useReadyFrames)
++                {
++                    // Do not contend with the backend's EvaluateState lock while holding _readyMutex.
++                    // Activation must precede resource submission; Present rechecks accepted inputs.
++                    auto activate = [&]()
++                    {
++                        if (!fgOutput->IsActive() && !fgOutput->IsPaused() && data.reset != sl::Boolean::eTrue &&
++                            AllowReadyActivation(frameId, viewport))
++                        {
++                            fgOutput->Activate();
++                            if (fgOutput->IsActive())
++                                LOG_INFO("Streamline FG enabled after Ready Frames warm-up");
++                        }
++                    };
++                    if (fgOutput->Mutex.isLockedByThisThread())
++                        activate();
++                    else
++                    {
++                        OwnedLockGuard lock(fgOutput->Mutex, 556);
++                        activate();
++                    }
++                }
++                else
++                    fgOutput->Activate();
+             }
+             else if (!fgOutput->IsActive() || fgOutput->IsPaused())
+             {
+@@ -321,7 +441,30 @@
+         _inputsUntagged = tag.resource == nullptr || tag.resource->native == nullptr;
+ }
+ 
+-bool Sl_Inputs::reportResource(const sl::ResourceTag& tag, void* cmdBuffer, uint32_t frameId)
++void Sl_Inputs::ObserveReadyTag(const sl::ResourceTag& tag, uint32_t frameId, std::optional<uint32_t> viewport)
++{
++    if (!viewport || !SupportsReadyFrames() || !Config::Instance()->FGDLSSGRequiredReadyFrames.value_or_default())
++        return;
++
++    auto type = GetResourceType(tag.type);
++    if (type != FG_ResourceType::Depth && type != FG_ResourceType::Velocity)
++        return;
++
++    // An un-tokened legacy tag is assigned to the same Streamline frame as the normal input path.
++    std::scoped_lock lock(_frameBoundaryMutex, _readyMutex);
++    if (!_readyRequested || _readyViewport != viewport)
++        return;
++
++    if (frameId == 0)
++        frameId = _currentFrameId;
++
++    _readyFrames.Observe(frameId, type == FG_ResourceType::Depth ? StreamlineReadyFrames::Depth
++                                                               : StreamlineReadyFrames::MotionVectors,
++                         tag.resource != nullptr && tag.resource->native != nullptr);
++}
++
++bool Sl_Inputs::reportResource(const sl::ResourceTag& tag, void* cmdBuffer, uint32_t frameId,
++                               std::optional<uint32_t> viewport)
+ {
+     auto& state = State::Instance();
+     state.dlssgLastFrame = state.fgLastFrame;
+@@ -342,16 +485,17 @@
+     if (tag.lifecycle == sl::eValidUntilEvaluate && ignoreValidUntilEvaluateForFG)
+         return false;
+ 
++    if (viewport && (tag.resource == nullptr || tag.resource->native == nullptr))
++    {
++        ObserveReadyTag(tag, frameId, viewport);
++        return false;
++    }
++
+     LOG_DEBUG("Reporting SL resource type: {} lifecycle: {} frameId: {}", tag.type,
+               magic_enum::enum_name(tag.lifecycle), frameId);
+ 
+     CheckForFrame(fgOutput, frameId);
+-
+-    if (tag.resource == nullptr || tag.resource->native == nullptr)
+-    {
+-        LOG_TRACE("tag.resource->native is null");
+-        return false;
+-    }
++    ObserveReadyTag(tag, frameId, viewport);
+ 
+     if (!cmdBuffer && tag.lifecycle == sl::eOnlyValidNow)
+         LOG_TRACE("cmdBuffer is null");
+@@ -479,6 +623,12 @@
+     _isFrameFinished = true;
+     _lastPresentFrameId = static_cast<uint32_t>(frameId);
+ 
++    if (SupportsReadyFrames())
++    {
++        std::scoped_lock readyLock(_readyMutex);
++        _readyPresentHint = _lastPresentFrameId;
++    }
++
+     if (auto fg = State::Instance().CurrentFG(); fg != nullptr)
+         fg->SetFrameCount(frameId);
+ }
+diff --git a/OptiScaler/inputs/FG/Streamline_Inputs.h b/OptiScaler/inputs/FG/Streamline_Inputs.h
+--- a/OptiScaler/inputs/FG/Streamline_Inputs.h
++++ b/OptiScaler/inputs/FG/Streamline_Inputs.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ #include "SysUtils.h"
++#include "StreamlineReadyFrames.h"
+ #include <sl.h>
+ #include <sl_dlss_g.h>
+ 
+@@ -28,11 +29,27 @@
+     void CheckForFrame(IFGFeature* fg, uint32_t frameId);
+     int IndexForFrameId(uint32_t frameId) const;
+ 
++    // Separate from the backend locks: never call the backend with this held.
++    std::mutex _readyMutex;
++    StreamlineReadyFrames _readyFrames;
++    std::optional<uint32_t> _readyViewport;
++    std::optional<uint32_t> _readyCandidate;
++    std::optional<uint32_t> _readyPresentHint;
++    bool _readyRequested = false;
++
++    void ResetReadyFramesLocked();
++    bool AllowReadyActivation(uint32_t frameId, uint32_t viewport);
++    void ObserveReadyTag(const sl::ResourceTag& tag, uint32_t frameId, std::optional<uint32_t> viewport);
++
+   public:
+-    bool setConstants(const sl::Constants& constants, uint32_t frameId);
++    bool setConstants(const sl::Constants& constants, uint32_t frameId, uint32_t viewport);
++    static bool SupportsReadyFrames();
++    void ReportReadyMode(bool enabled, uint32_t viewport);
++    void BeforeReadyPresent(IFGFeature* fg);
+     bool evaluateState();
+     // cmdBuffer is ID3D12GraphicsCommandList* or VkCommandBuffer
+-    bool reportResource(const sl::ResourceTag& tag, void* cmdBuffer, uint32_t frameId);
++    bool reportResource(const sl::ResourceTag& tag, void* cmdBuffer, uint32_t frameId,
++                        std::optional<uint32_t> viewport = std::nullopt);
+     void reportTagState(const sl::ResourceTag& tag);
+     void reportEngineType(sl::EngineType type) { engineType = type; };
+     void reportGameMode(sl::DLSSGMode mode) { _gameFGOff = mode == sl::DLSSGMode::eOff; };
+diff --git a/OptiScaler/framegen/IFGFeature_Dx12.cpp b/OptiScaler/framegen/IFGFeature_Dx12.cpp
+--- a/OptiScaler/framegen/IFGFeature_Dx12.cpp
++++ b/OptiScaler/framegen/IFGFeature_Dx12.cpp
+@@ -318,6 +318,10 @@
+ 
+ void IFGFeature_Dx12::NewFrame()
+ {
++    if (_waitingNewFrameData && Sl_Inputs::SupportsReadyFrames() &&
++        Config::Instance()->FGDLSSGRequiredReadyFrames.value_or_default() != 0)
++        _waitingNewFrameData = false; // The Streamline gate owns reactivation on this path.
++
+     if (_waitingNewFrameData)
+     {
+         LOG_DEBUG("Re-activating FG");
+diff --git a/OptiScaler/hooks/FG_Hooks.cpp b/OptiScaler/hooks/FG_Hooks.cpp
+--- a/OptiScaler/hooks/FG_Hooks.cpp
++++ b/OptiScaler/hooks/FG_Hooks.cpp
+@@ -1440,8 +1440,17 @@
+     }
+ 
+     const bool useMutex = config->FGUseMutexForSwapchain.value_or_default();
++    const bool checkReadyFrames = willPresent && fg != nullptr && This == state.currentFGSwapchain &&
++                                  Sl_Inputs::SupportsReadyFrames() &&
++                                  config->FGDLSSGRequiredReadyFrames.value_or_default() != 0;
+     bool mutexUsed = false;
+-    if (willPresent && fg != nullptr && fg->IsActive() && !fg->IsPaused() && useMutex && fg->Mutex.getOwner() != 2)
++    if (checkReadyFrames && !fg->Mutex.isLockedByThisThread())
++    {
++        fg->Mutex.lock(2);
++        mutexUsed = true;
++    }
++    else if (!checkReadyFrames && willPresent && fg != nullptr && fg->IsActive() && !fg->IsPaused() && useMutex &&
++             fg->Mutex.getOwner() != 2)
+     {
+         LOG_TRACE("Waiting FG->Mutex 2, current: {}", fg->Mutex.getOwner());
+         fg->Mutex.lock(2);
+@@ -1449,9 +1458,13 @@
+         LOG_TRACE("Accuired FG->Mutex: {}", fg->Mutex.getOwner());
+     }
+ 
++    if (checkReadyFrames)
++        state.slFGInputs.BeforeReadyPresent(fg);
++
+     // FG can become active after the check above, its Present then would race with EvaluateState
+     const bool fgFeatureActive =
+-        fg != nullptr && fg->IsActive() && !fg->IsPaused() && (!useMutex || mutexUsed || fg->Mutex.getOwner() == 2);
++        fg != nullptr && fg->IsActive() && !fg->IsPaused() &&
++        (!useMutex || mutexUsed || (checkReadyFrames && fg->Mutex.isLockedByThisThread()) || fg->Mutex.getOwner() == 2);
+ 
+     sl::FrameToken* localToken = nullptr;
+     sl::Result tokenResult = sl::Result::eErrorReflexAPI;
+diff --git a/OptiScaler/hooks/Streamline_Hooks.cpp b/OptiScaler/hooks/Streamline_Hooks.cpp
+--- a/OptiScaler/hooks/Streamline_Hooks.cpp
++++ b/OptiScaler/hooks/Streamline_Hooks.cpp
+@@ -455,6 +455,8 @@
+     // Only reading v1 fields, safe for any struct version
+     const bool enabled = options.mode != sl::DLSSGMode::eOff;
+     const int count = std::max(static_cast<int>(options.numFramesToGenerate), 1);
++    if (state.activeFgInput == FGInput::DLSSG)
++        state.slFGInputs.ReportReadyMode(enabled, static_cast<uint32_t>(viewport));
+ 
+     if (enabled != state.dlssgInputGameEnabled || count != state.dlssgInputGameInterpolationCount)
+     {
+@@ -560,6 +562,9 @@
+ 
+         if (tags[i].resource == nullptr || tags[i].resource->native == nullptr)
+         {
++            if (State::Instance().slFGInputs.SupportsReadyFrames() &&
++                Config::Instance()->FGDLSSGRequiredReadyFrames.value_or_default() != 0)
++                State::Instance().slFGInputs.reportResource(tags[i], cmdBuffer, 0, static_cast<uint32_t>(viewport));
+             LOG_TRACE("Resource of type: {} is null, continuing", magic_enum::enum_name(typeEnum));
+             continue;
+         }
+@@ -580,7 +585,7 @@
+              tags[i].type == sl::kBufferTypeMotionVectors || tags[i].type == sl::kBufferTypeUIColorAndAlpha ||
+              tags[i].type == sl::kBufferTypeBidirectionalDistortionField))
+         {
+-            State::Instance().slFGInputs.reportResource(tags[i], cmdBuffer, 0);
++            State::Instance().slFGInputs.reportResource(tags[i], cmdBuffer, 0, static_cast<uint32_t>(viewport));
+         }
+         else if (State::Instance().activeFgInput == FGInput::NvngxFG)
+         {
+@@ -652,7 +657,10 @@
+ 
+         if (resources[i].resource == nullptr || resources[i].resource->native == nullptr)
+         {
+-            LOG_TRACE("Resource of type: {} is null, continuing", magic_enum::enum_name(typeEnum));
++            if (State::Instance().slFGInputs.SupportsReadyFrames() &&
++                Config::Instance()->FGDLSSGRequiredReadyFrames.value_or_default() != 0)
++                State::Instance().slFGInputs.reportResource(resources[i], cmdBuffer, (uint32_t) frame,
++                                                           static_cast<uint32_t>(viewport));
+             continue;
+         }
+ 
+@@ -662,7 +670,8 @@
+              resources[i].type == sl::kBufferTypeMotionVectors || resources[i].type == sl::kBufferTypeUIColorAndAlpha ||
+              resources[i].type == sl::kBufferTypeBidirectionalDistortionField))
+         {
+-            State::Instance().slFGInputs.reportResource(resources[i], cmdBuffer, (uint32_t) frame);
++            State::Instance().slFGInputs.reportResource(resources[i], cmdBuffer, (uint32_t) frame,
++                                                       static_cast<uint32_t>(viewport));
+         }
+         else if (State::Instance().activeFgInput == FGInput::NvngxFG)
+         {
+@@ -1352,7 +1361,7 @@
+     std::scoped_lock lock(setConstantsMutex);
+     LOG_TRACE("called with frameIndex: {}, viewport: {}", (unsigned int) frame, (unsigned int) viewport);
+ 
+-    State::Instance().slFGInputs.setConstants(values, (uint32_t) frame);
++    State::Instance().slFGInputs.setConstants(values, (uint32_t) frame, static_cast<uint32_t>(viewport));
+ 
+     return o_slSetConstants(values, frame, viewport);
+ }
+@@ -1431,6 +1440,8 @@
+ 
+     auto& state = State::Instance();
+     state.slFGInputs.reportGameMode(newOptions.mode);
++    if (state.activeFgInput == FGInput::DLSSG)
++        state.slFGInputs.ReportReadyMode(newOptions.mode != sl::DLSSGMode::eOff, static_cast<uint32_t>(viewport));
+ 
+     // Disable game's DLSSG when we are trying to create our own instance of DLSSG
+     if (state.activeFgInput != FGInput::DLSSG && state.activeFgOutput == FGOutput::DLSSG)
+diff --git a/OptiScaler/menu/menu_common.cpp b/OptiScaler/menu/menu_common.cpp
+--- a/OptiScaler/menu/menu_common.cpp
++++ b/OptiScaler/menu/menu_common.cpp
+@@ -5319,6 +5319,16 @@
+                     ShowTooltip("Number of frames the FG is allowed to be ahead of the game\n"
+                                 "Might prevent FG on/off switching, but also might cause issues");
+ 
++                    if (Sl_Inputs::SupportsReadyFrames())
++                    {
++                        auto readyFrames = config->FGDLSSGRequiredReadyFrames.value_or_default();
++                        if (ImGui::InputInt("Ready Frames", &readyFrames, 1, 10) && readyFrames >= 0 && readyFrames <= 300)
++                            config->FGDLSSGRequiredReadyFrames = readyFrames;
++
++                        ShowTooltip("Consecutive complete frames before enabling FSR FG or XeFG.\n"
++                                    "0 restores the original behavior; 30 is the default.");
++                    }
++
+                     ImGui::PopItemWidth();
+ 
+                     // Only FSR FG and XeFG take frame times
