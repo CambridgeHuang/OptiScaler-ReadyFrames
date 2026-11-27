@@ -1,14 +1,29 @@
 # OptiScaler Ready Frames (based on `b7b07d2d`)
 
-Unofficial OptiScaler build with a configurable **Ready Frames** gate for DX12
-Streamline 2 DLSS-G input paired with FSR FG or XeFG output. FSR FG was the first
-implementation priority; XeFG uses the same shared path. The gate waits for a
-number of consecutive frames with constants, depth, and motion-vector inputs
-before allowing frame generation to activate.
+> 增加了「Ready Frames」闸门的非官方 OptiScaler 构建，用于缓解帧生成被频繁开关
+> （进出菜单、切换场景、反复过场）时出现的崩溃与闪退。适用于包括但不限于《燕云
+> 十六声》国服及国际服等需要频繁切换帧生成状态的游戏，不限显卡品牌，主要面向希望
+> 让游戏走 DLSS 帧生成管线、再用 FSR/XeFG 输出的 AMD 用户。**实测配置与验证范围见
+> 下文「测试情况与适用范围」。**
+>
+> An unofficial OptiScaler build with a "Ready Frames" gate that reduces crashes
+> when frame generation is toggled on and off repeatedly (menus, scene switches,
+> frequent cutscenes). Applies to Where Winds Meet (mainland China and
+> international) and to any title that switches frame generation frequently — not
+> limited to that game or to a single GPU vendor; primarily aimed at AMD users who
+> want DLSS frame-gen input with FSR FG / XeFG output. **Tested configuration and
+> scope: see "Tested & Scope" below.**
 
-This build is **not** a general-purpose crash fix. Its tested scope is described
-below. It is based on upstream OptiScaler commit
-`b7b07d2d19ba1b19fab07f6189d239dd49ea4552` (2026-11-23).
+## 技术说明 / How it works
+
+The gate applies to DX12 Streamline 2 DLSS-G input paired with FSR FG or XeFG
+output. FSR FG was the first implementation priority; XeFG uses the same shared
+path. It waits for a number of consecutive frames with constants, depth, and
+motion-vector inputs before allowing frame generation to activate.
+
+Based on upstream OptiScaler commit `b7b07d2d19ba1b19fab07f6189d239dd49ea4552`
+(2026-11-23). Scope is limited to the configurations and titles described under
+**Tested & Scope** — this is not a blanket fix for unrelated crashes.
 
 ## 我该下载哪个 / Which file do I need?
 
@@ -103,3 +118,11 @@ additional restrictions, so the paragraph above is a statement of position and i
 not enforceable as a condition. Your rights under GPL-3.0 are unaffected. The
 upstream project likewise states that OptiScaler is free and that any monetary
 requirement is a scam.
+
+## 支持这个项目 / Support
+
+如果这个构建对你有帮助，欢迎给仓库点一颗 Star ⭐——这是最直接的反馈，也是我继续
+跟进上游、重新构建新版本的动力。
+
+If this build helped you, a ⭐ on the repo is the most direct feedback I get — it is
+what keeps me rebasing on upstream and publishing new builds.
